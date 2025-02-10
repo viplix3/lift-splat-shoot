@@ -278,7 +278,7 @@ def compile_data(
 ):
     nusc = NuScenes(
         version="v1.0-{}".format(version),
-        dataroot=os.path.join(dataroot, version),
+        dataroot=dataroot,
         verbose=False,
     )
     parser = {
