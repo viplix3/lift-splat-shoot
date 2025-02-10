@@ -188,6 +188,34 @@ normalize_img = torchvision.transforms.Compose(
 
 
 def gen_dx_bx(xbound, ybound, zbound):
+    """
+    Generate step sizes (dx), center offsets (bx), and bin counts (nx) for x, y, and z axes.
+
+    Each bound should be a list/tuple of the form [lower_bound, upper_bound, step_size].
+    For example:
+        xbound = [x_min, x_max, x_step]
+        ybound = [y_min, y_max, y_step]
+        zbound = [z_min, z_max, z_step]
+
+    Parameters
+    ----------
+    xbound : list or tuple of float
+        [x_min, x_max, x_step]
+    ybound : list or tuple of float
+        [y_min, y_max, y_step]
+    zbound : list or tuple of float
+        [z_min, z_max, z_step]
+
+    Returns
+    -------
+    dx : torch.Tensor
+        A 1D tensor of length 3, containing the step sizes (x_step, y_step, z_step).
+    bx : torch.Tensor
+        A 1D tensor of length 3, where each element is the midpoint of the first bin
+        in the corresponding dimension (x, y, z).
+    nx : torch.LongTensor
+        A 1D tensor of length 3, representing the total number of bins along x, y, and z.
+    """
     dx = torch.Tensor([row[2] for row in [xbound, ybound, zbound]])
     bx = torch.Tensor([row[0] + row[2] / 2.0 for row in [xbound, ybound, zbound]])
     nx = torch.LongTensor(

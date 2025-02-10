@@ -153,28 +153,53 @@ class LiftSplatShoot(nn.Module):
         self.use_quickcumsum = True
 
     def create_frustum(self):
-        # make grid in image plane
+        """
+        Create a 3D frustum grid for the downsampled image plane plus depth dimension.
+
+        The frustum defines a set of 3D points in (x, y, d) space:
+        - (x, y) covers the pixel locations in the feature map (downsampled image),
+        - d covers a sequence of depth values from d_min to d_max in dbound.
+
+        Returns
+        -------
+        nn.Parameter
+            A tensor of shape (D, fH, fW, 3), where:
+                D is the number of depth bins,
+                fH and fW are the downsampled height and width,
+            and each element is (x_pixel, y_pixel, depth).
+            The parameter is set to not require gradient.
+        """
+        # Extract final image dimensions
         ogfH, ogfW = self.data_aug_conf["final_dim"]
+
+        # Downsampled feature map size
         fH, fW = ogfH // self.downsample, ogfW // self.downsample
+
+        # Depth bins
         ds = (
             torch.arange(*self.grid_conf["dbound"], dtype=torch.float)
             .view(-1, 1, 1)
             .expand(-1, fH, fW)
         )
         D, _, _ = ds.shape
+
+        # x-coordinates in [0..(ogfW-1)], downsampled
         xs = (
             torch.linspace(0, ogfW - 1, fW, dtype=torch.float)
             .view(1, 1, fW)
             .expand(D, fH, fW)
         )
+        # y-coordinates in [0..(ogfH-1)], downsampled
         ys = (
             torch.linspace(0, ogfH - 1, fH, dtype=torch.float)
             .view(1, fH, 1)
             .expand(D, fH, fW)
         )
 
-        # D x H x W x 3
-        frustum = torch.stack((xs, ys, ds), -1)
+        # Stack into (D, fH, fW, 3) for (x, y, d)
+        frustum = torch.stack((xs, ys, ds), dim=-1)
+
+        # Store as a parameter (no gradients needed)
         return nn.Parameter(frustum, requires_grad=False)
 
     def get_geometry(self, rots, trans, intrins, post_rots, post_trans):
