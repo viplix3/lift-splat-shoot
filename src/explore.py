@@ -353,11 +353,11 @@ def viz_model_preds(
     bot_pct_lim=(0.0, 0.22),
     rot_lim=(-5.4, 5.4),
     rand_flip=True,
-    xbound=[-50.0, 50.0, 0.5],
-    ybound=[-50.0, 50.0, 0.5],
-    zbound=[-10.0, 10.0, 20.0],
-    dbound=[4.0, 45.0, 1.0],
-    bsz=4,
+    xbound=[-50.0, 50.0, 0.5],  # minx, maxx, step_size (for BEV)
+    ybound=[-50.0, 50.0, 0.5],  # miny, maxy, step_size (for BEV)
+    zbound=[-10.0, 10.0, 20.0],  # minz, maxz, step_size (for BEV)
+    dbound=[4.0, 45.0, 1.0],  # min_dist, max_dist, step_size (for depth bins)
+    bsz=1,  # Batch size
     nworkers=10,
 ):
     grid_conf = {
@@ -383,7 +383,7 @@ def viz_model_preds(
         "rand_flip": rand_flip,
         "bot_pct_lim": bot_pct_lim,
         "cams": cams,
-        "Ncams": 5,
+        "Ncams": 6,
     }
     trainloader, valloader = compile_data(
         version,
@@ -420,6 +420,11 @@ def viz_model_preds(
 
     model.eval()
     counter = 0
+
+    import time
+
+    num_images = 0
+    model_inference_time = 0
     with torch.no_grad():
         for batchi, (
             imgs,
@@ -430,6 +435,7 @@ def viz_model_preds(
             post_trans,
             binimgs,
         ) in enumerate(loader):
+            tick = time.time()
             out = model(
                 imgs.to(device),
                 rots.to(device),
@@ -439,6 +445,10 @@ def viz_model_preds(
                 post_trans.to(device),
             )
             out = out.sigmoid().cpu()
+            tock = time.time()
+
+            model_inference_time += tock - tick
+            num_images += 1
 
             for si in range(imgs.shape[0]):
                 plt.clf()
@@ -483,7 +493,11 @@ def viz_model_preds(
                 plt.ylim((0, out.shape[3]))
                 add_ego(bx, dx)
 
-                imname = f"eval{batchi:06}_{si:03}.jpg"
+                imname = f"outputs/eval{batchi:06}_{si:03}.jpg"
                 print("saving", imname)
                 plt.savefig(imname)
                 counter += 1
+
+    print(
+        f"Model inference time per image: {model_inference_time / (num_images * bsz):.2f} seconds"
+    )
