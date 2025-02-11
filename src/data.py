@@ -106,31 +106,73 @@ class NuscData(torch.utils.data.Dataset):
         return samples
 
     def sample_augmentation(self):
+        """
+        Randomly (or deterministically) resize and crop the input image to final_dim.
+
+        During training (self.is_train == True):
+        1. Randomly select a resize factor in 'resize_lim'.
+        2. Compute newW, newH as the resized width and height.
+        3. Randomly shift the crop region horizontally within [0, newW - fW].
+        4. Vertically, compute 'crop_h' using a random bottom fraction limit so that
+            the final crop is fH high, and can shift up/down.
+        5. Potentially apply random horizontal flip and random rotation.
+
+        During validation/testing (self.is_train == False):
+        1. Compute a deterministic resize factor ensuring the final crop fits.
+        2. Center the crop horizontally, and use the mean of 'bot_pct_lim' vertically.
+
+        Returns
+        -------
+        resize : float
+            The chosen resize factor.
+        resize_dims : tuple
+            The (width, height) after resizing.
+        crop : tuple
+            The bounding box (left, top, right, bottom) for the final crop.
+        flip : bool
+            Whether to horizontally flip the image (only in training).
+        rotate : float
+            The rotation in degrees (only in training).
+        """
         H, W = self.data_aug_conf["H"], self.data_aug_conf["W"]
         fH, fW = self.data_aug_conf["final_dim"]
+
         if self.is_train:
+            # 1) Random resize
             resize = np.random.uniform(*self.data_aug_conf["resize_lim"])
             resize_dims = (int(W * resize), int(H * resize))
             newW, newH = resize_dims
+
+            # 2) Random vertical crop
             crop_h = (
                 int((1 - np.random.uniform(*self.data_aug_conf["bot_pct_lim"])) * newH)
                 - fH
             )
+            # 3) Random horizontal crop
             crop_w = int(np.random.uniform(0, max(0, newW - fW)))
             crop = (crop_w, crop_h, crop_w + fW, crop_h + fH)
+
+            # 4) Optional flip
             flip = False
             if self.data_aug_conf["rand_flip"] and np.random.choice([0, 1]):
                 flip = True
+
+            # 5) Random rotation
             rotate = np.random.uniform(*self.data_aug_conf["rot_lim"])
+
         else:
+            # Validation/test: deterministic crop
             resize = max(fH / H, fW / W)
             resize_dims = (int(W * resize), int(H * resize))
             newW, newH = resize_dims
+
             crop_h = int((1 - np.mean(self.data_aug_conf["bot_pct_lim"])) * newH) - fH
             crop_w = int(max(0, newW - fW) / 2)
             crop = (crop_w, crop_h, crop_w + fW, crop_h + fH)
+
             flip = False
             rotate = 0
+
         return resize, resize_dims, crop, flip, rotate
 
     def get_image_data(self, rec, cams):

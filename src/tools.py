@@ -132,22 +132,81 @@ def get_rot(h):
 
 
 def img_transform(img, post_rot, post_tran, resize, resize_dims, crop, flip, rotate):
-    # adjust image
+    """
+    Apply geometric transformations to `img` and update the associated
+    2D affine transform parameters `post_rot` and `post_tran`.
+
+    The transformations include:
+      - Resizing to `resize_dims`
+      - Cropping according to `crop`
+      - Optional horizontal flip
+      - Rotation by `rotate` degrees
+
+    Parameters
+    ----------
+    img : PIL.Image
+        Input image to be transformed.
+    post_rot : torch.Tensor of shape (2, 2)
+        2D linear (affine) transform matrix that will be updated to reflect
+        the cumulative scaling, flipping, and rotation.
+    post_tran : torch.Tensor of shape (2,)
+        2D translation vector that will be updated to reflect the cumulative
+        shifts from cropping, flipping, and rotation.
+    resize : float
+        Scaling factor for the image.
+    resize_dims : tuple of (width, height)
+        Dimensions to which the image is resized.
+    crop : tuple of (left, top, right, bottom)
+        The cropping region in the resized image.
+    flip : bool
+        Whether to apply a horizontal flip.
+    rotate : float
+        Rotation angle in degrees to apply to the image.
+
+    Returns
+    -------
+    img : PIL.Image
+        The transformed image.
+    post_rot : torch.Tensor of shape (2, 2)
+        Updated 2D affine transform matrix after applying all the transformations.
+    post_tran : torch.Tensor of shape (2,)
+        Updated 2D translation vector after applying all the transformations.
+
+    Notes
+    -----
+    - post_rot and post_tran together define the full homography that maps
+      original image coordinates into the final transformed image.
+    - The order of operations here (resize → crop → flip → rotate) is critical,
+      and each step updates `post_rot` and `post_tran`.
+    """
+
+    # 1) Resize the image
     img = img.resize(resize_dims)
+
+    # 2) Crop
     img = img.crop(crop)
+
+    # 3) Optional horizontal flip
     if flip:
         img = img.transpose(method=Image.FLIP_LEFT_RIGHT)
+
+    # 4) Rotation
     img = img.rotate(rotate)
 
-    # post-homography transformation
+    # -- Update post-rot and post-tran --
+    # Resize
     post_rot *= resize
     post_tran -= torch.Tensor(crop[:2])
+
+    # Flip
     if flip:
         A = torch.Tensor([[-1, 0], [0, 1]])
         b = torch.Tensor([crop[2] - crop[0], 0])
         post_rot = A.matmul(post_rot)
         post_tran = A.matmul(post_tran) + b
-    A = get_rot(rotate / 180 * np.pi)
+
+    # Rotate
+    A = get_rot(rotate / 180 * np.pi)  # Rotation matrix
     b = torch.Tensor([crop[2] - crop[0], crop[3] - crop[1]]) / 2
     b = A.matmul(-b) + b
     post_rot = A.matmul(post_rot)
