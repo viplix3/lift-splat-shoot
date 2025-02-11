@@ -203,14 +203,47 @@ class LiftSplatShoot(nn.Module):
         return nn.Parameter(frustum, requires_grad=False)
 
     def get_geometry(self, rots, trans, intrins, post_rots, post_trans):
-        """Determine the (x,y,z) locations (in the ego frame)
-        of the points in the point cloud.
-        Returns B x N x D x H/downsample x W/downsample x 3
         """
+        Compute 3D points in the ego vehicle frame from the frustum coordinates.
+
+        This function:
+        1) Subtracts and inverts the post-translations and post-rotations to
+            'undo' the data augmentations applied to the images.
+        2) Converts the (x, y, depth) points from image space to 3D camera space
+            by multiplying (x, y) with depth (z).
+        3) Applies camera intrinsics (inverse) and extrinsics (rots, trans) to map
+            those camera coordinates into the ego vehicle frame.
+
+        Parameters
+        ----------
+        rots : torch.Tensor (B, N, 3, 3)
+            Rotation matrices for each camera from camera-to-ego frame.
+        trans : torch.Tensor (B, N, 3)
+            Translation vectors for each camera from camera-to-ego frame.
+        intrins : torch.Tensor (B, N, 3, 3)
+            Camera intrinsic matrices.
+        post_rots : torch.Tensor (B, N, 3, 3)
+            Rotation matrices of the augmentation transforms applied to the images.
+        post_trans : torch.Tensor (B, N, 3)
+            Translation vectors of the augmentation transforms applied to the images.
+
+        Returns
+        -------
+        points : torch.Tensor (B, N, D, H, W, 3)
+            The 3D points in ego coordinates for each depth bin, pixel location,
+            camera, and batch element.
+
+        Notes
+        -----
+        - self.frustum is expected to have shape (D, H, W, 3), and is broadcasted
+        to (B, N, D, H, W, 3).
+        - The transformations are applied in reverse order of how the augmentations
+        were generated, then we do camera-to-ego transformations.
+        """
+
         B, N, _ = trans.shape
 
-        # undo post-transformation
-        # B x N x D x H x W x 3
+        # 1) Undo the post-transformation in image space
         points = self.frustum - post_trans.view(B, N, 1, 1, 1, 3)
         points = (
             torch.inverse(post_rots)
@@ -218,52 +251,115 @@ class LiftSplatShoot(nn.Module):
             .matmul(points.unsqueeze(-1))
         )
 
-        # cam_to_ego
+        # 2) Convert (x, y, depth) -> (X_cam, Y_cam, Z_cam)
         points = torch.cat(
             (
                 points[:, :, :, :, :, :2] * points[:, :, :, :, :, 2:3],
                 points[:, :, :, :, :, 2:3],
             ),
-            5,
+            dim=5,
         )
+
+        # 3) Apply camera intrinsics inverse and extrinsics
         combine = rots.matmul(torch.inverse(intrins))
         points = combine.view(B, N, 1, 1, 1, 3, 3).matmul(points).squeeze(-1)
+
+        # 4) Add camera-to-ego translation
         points += trans.view(B, N, 1, 1, 1, 3)
 
         return points
 
     def get_cam_feats(self, x):
-        """Return B x N x D x H/downsample x W/downsample x C"""
+        """
+        Encode camera features, reshaping to/from (B, N) format and returning a
+        6D tensor with a specific layout.
+
+        The input 'x' has shape:
+            (B, N, C, imH, imW)
+        where B = batch size, N = number of cameras, C = input channels,
+        imH and imW are the feature map dimensions.
+
+        Steps:
+        1) Flatten B and N into one dimension for camera encoding: (B*N, C, imH, imW).
+        2) Pass through camera encoder self.camencode(...).
+        3) Reshape to (B, N, camC, D, imH//downsample, imW//downsample),
+            where camC and D depend on the encoder's output channels.
+        4) Permute dimensions to (B, N, D, imH//downsample, imW//downsample, camC).
+
+        Returns
+        -------
+        torch.Tensor
+            A feature tensor of shape (B, N, D, H/downsample, W/downsample, C).
+        """
         B, N, C, imH, imW = x.shape
 
+        # (B*N, C, imH, imW)
         x = x.view(B * N, C, imH, imW)
+
+        # Camera encoding (e.g., a CNN)
         x = self.camencode(x)
+
+        # (B, N, camC, D, imH//downsample, imW//downsample)
         x = x.view(
             B, N, self.camC, self.D, imH // self.downsample, imW // self.downsample
         )
+
+        # (B, N, D, imH//downsample, imW//downsample, camC)
         x = x.permute(0, 1, 3, 4, 5, 2)
 
         return x
 
     def voxel_pooling(self, geom_feats, x):
+        """
+        Voxel-pool the per-camera, per-pixel features into a BEV volume, then collapse Z.
+
+        Parameters
+        ----------
+        geom_feats : torch.Tensor
+            Shape (B, N, D, H, W, 3). For each batch, camera, depth-bin, height, width,
+            this contains 3D coordinates (X, Y, Z) in some continuous or integer space.
+        x : torch.Tensor
+            Shape (B, N, D, H, W, C). The feature vectors associated with each point
+            in geom_feats.
+
+        Returns
+        -------
+        final : torch.Tensor
+            A tensor of shape (B, C*Z, X, Y), where:
+            - Z is the discretized size in self.nx[2],
+            - X, Y are from self.nx[0], self.nx[1],
+            - The channel dimension is C*Z due to collapsing the Z dimension.
+
+        Steps
+        -----
+        1) Flatten x to (Nprime, C) and geom_feats to (Nprime, 3) (plus we append batch indices).
+        2) Discretize geom_feats into voxel indices by subtracting an offset, dividing by dx, and casting to int.
+        3) Filter out-of-bounds indices.
+        4) Sort by a 'rank' so that points belonging to the same voxel are consecutive.
+        5) Use a cumsum trick or specialized function to pool (sum/max) features within each voxel.
+        6) Create a voxel grid (B, C, Z, X, Y) and place the pooled features at the correct positions.
+        7) Finally, collapse the Z dimension by concatenating along the channel axis, yielding (B, C*Z, X, Y).
+        """
         B, N, D, H, W, C = x.shape
         Nprime = B * N * D * H * W
 
-        # flatten x
+        # 1) Flatten feature tensor
         x = x.reshape(Nprime, C)
 
-        # flatten indices
+        # 2) Discretize geometry into voxel indices
         geom_feats = ((geom_feats - (self.bx - self.dx / 2.0)) / self.dx).long()
         geom_feats = geom_feats.view(Nprime, 3)
+
+        # 3) Add batch index
         batch_ix = torch.cat(
             [
                 torch.full([Nprime // B, 1], ix, device=x.device, dtype=torch.long)
                 for ix in range(B)
             ]
         )
-        geom_feats = torch.cat((geom_feats, batch_ix), 1)
+        geom_feats = torch.cat((geom_feats, batch_ix), 1)  # (Nprime, 4)
 
-        # filter out points that are outside box
+        # 4) Filter out-of-bounds
         kept = (
             (geom_feats[:, 0] >= 0)
             & (geom_feats[:, 0] < self.nx[0])
@@ -275,7 +371,7 @@ class LiftSplatShoot(nn.Module):
         x = x[kept]
         geom_feats = geom_feats[kept]
 
-        # get tensors from the same voxel next to each other
+        # 5) Sort by voxel rank
         ranks = (
             geom_feats[:, 0] * (self.nx[1] * self.nx[2] * B)
             + geom_feats[:, 1] * (self.nx[2] * B)
@@ -285,20 +381,20 @@ class LiftSplatShoot(nn.Module):
         sorts = ranks.argsort()
         x, geom_feats, ranks = x[sorts], geom_feats[sorts], ranks[sorts]
 
-        # cumsum trick
+        # 6) Pool features in the same voxel
         if not self.use_quickcumsum:
             x, geom_feats = cumsum_trick(x, geom_feats, ranks)
         else:
             x, geom_feats = QuickCumsum.apply(x, geom_feats, ranks)
 
-        # griddify (B x C x Z x X x Y)
+        # 7) Create voxel grid (B, C, Z, X, Y)
         final = torch.zeros((B, C, self.nx[2], self.nx[0], self.nx[1]), device=x.device)
         final[
             geom_feats[:, 3], :, geom_feats[:, 2], geom_feats[:, 0], geom_feats[:, 1]
         ] = x
 
-        # collapse Z
-        final = torch.cat(final.unbind(dim=2), 1)
+        # 8) Collapse Z dimension -> (B, C*Z, X, Y)
+        final = torch.cat(final.unbind(dim=2), dim=1)
 
         return final
 

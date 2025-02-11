@@ -234,29 +234,67 @@ class NuscData(torch.utils.data.Dataset):
         return torch.Tensor(pts)[:3]  # x,y,z
 
     def get_binimg(self, rec):
+        """
+        Create a binary BEV mask indicating the footprints of vehicles in the given record.
+
+        1. Retrieves the ego vehicle pose (translation and rotation) to transform all boxes
+        into the ego frame.
+        2. Initializes a 2D numpy array (img) of shape [nx[0], nx[1]] to zero.
+        3. For each annotation (instance) in rec["anns"]:
+        - Skips if not a 'vehicle'.
+        - Constructs a NuScenes bounding box from translation, size, and rotation.
+        - Transforms the box to the ego frame by applying the negative ego translation
+            and the inverse ego rotation.
+        - Extracts the bottom (x, y) corners, transforms them into the discretized BEV grid,
+            and fills the corresponding polygon in img with 1.0.
+        4. Returns the final mask as a Torch tensor of shape (1, nx[0], nx[1]).
+
+        Parameters
+        ----------
+        rec : dict
+            A NuScenes record containing 'anns' (annotation tokens) and references to sample data.
+
+        Returns
+        -------
+        torch.Tensor
+            A binary BEV mask with shape (1, nx[0], nx[1]). Cells are 1 where a vehicle is present,
+            otherwise 0.
+        """
+        # 1. Obtain ego pose
         egopose = self.nusc.get(
             "ego_pose",
             self.nusc.get("sample_data", rec["data"]["LIDAR_TOP"])["ego_pose_token"],
         )
         trans = -np.array(egopose["translation"])
         rot = Quaternion(egopose["rotation"]).inverse
+
+        # 2. Initialize binary image
         img = np.zeros((self.nx[0], self.nx[1]))
+
+        # 3. Process annotations
         for tok in rec["anns"]:
             inst = self.nusc.get("sample_annotation", tok)
-            # add category for lyft
             if not inst["category_name"].split(".")[0] == "vehicle":
                 continue
+
+            # 4. Construct and transform bounding box
             box = Box(inst["translation"], inst["size"], Quaternion(inst["rotation"]))
             box.translate(trans)
             box.rotate(rot)
 
-            pts = box.bottom_corners()[:2].T
+            # 5. Project corners to BEV
+            pts = box.bottom_corners()[:2].T  # shape (4,2)
             pts = np.round(
                 (pts - self.bx[:2] + self.dx[:2] / 2.0) / self.dx[:2]
             ).astype(np.int32)
+
+            # swap x,y columns to (row,col)
             pts[:, [1, 0]] = pts[:, [0, 1]]
+
+            # 6. Fill polygon
             cv2.fillPoly(img, [pts], 1.0)
 
+        # 7. Convert to Torch tensor
         return torch.Tensor(img).unsqueeze(0)
 
     def choose_cams(self):
